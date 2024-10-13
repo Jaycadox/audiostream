@@ -1,0 +1,13 @@
+[package]
+name = "audiostream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = "1.19.0"
+cpal = "0.15.3"
+quinn = "0.11.5"
+rcgen = "0.13.1"
+ringbuf = "0.4.7"
+rustls = { version = "0.23.14", features = ["ring"] }
+tokio = { version = "1.40.0", features = ["full"] }
