@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.89"
+audiopus = { version = "0.2.0", features = ["default_features"] }
 bytemuck = "1.19.0"
+byteorder = "1.5.0"
 cpal = "0.15.3"
+crossbeam = "0.8.4"
+eframe = "0.29.1"
 quinn = "0.11.5"
 rcgen = "0.13.1"
 ringbuf = "0.4.7"
