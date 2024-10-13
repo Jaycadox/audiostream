@@ -67,6 +67,7 @@ async fn start_audio_channel<
                 }
                 .pop_slice(&mut samples[cursor..]);
                 cursor += len;
+                tokio::task::yield_now().await;
             }
             let len = 2880;
             if len == 0 {
