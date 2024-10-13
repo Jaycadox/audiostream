@@ -106,15 +106,16 @@ async fn start_audio_channel<
             let Ok(_) = rx.read_exact(&mut buf).await else {
                 break;
             };
-            let mut samples = vec![];
-            decoder
+            println!("len = {len}");
+            let mut samples = vec![0.0; 2880 * 5];
+            let len = decoder
                 .decode_float(Some(&buf), &mut samples, false)
-                .unwrap();
+                .expect("decode error");
             match producer.lock() {
                 Ok(x) => x,
                 _ => break,
             }
-            .push_slice(&samples);
+            .push_slice(&samples[..len]);
             tokio::task::yield_now().await;
         }
         println!("stopping audio read");
