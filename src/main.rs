@@ -12,7 +12,7 @@ use std::{
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
-    InputCallbackInfo, OutputCallbackInfo, StreamConfig,
+    Device, Host, InputCallbackInfo, OutputCallbackInfo, StreamConfig,
 };
 use eframe::egui::{self, Vec2b};
 use egui_plot::{AxisHints, Line, Plot, PlotBounds, PlotPoints};
@@ -187,14 +187,16 @@ enum AudioEncoding {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ConnectionSettings {
     encoding: AudioEncoding,
     latency: f32,
+    input_device_name: String,
+    output_device_name: String,
 }
 
-impl Default for ConnectionSettings {
-    fn default() -> Self {
+impl ConnectionSettings {
+    fn new(host: &Host) -> Self {
         Self {
             encoding: AudioEncoding::Opus {
                 purpose: audiopus::Application::Voip,
@@ -203,6 +205,8 @@ impl Default for ConnectionSettings {
                 signal_type: audiopus::Signal::Voice,
             },
             latency: 0.1,
+            input_device_name: host.default_input_device().unwrap().name().unwrap(),
+            output_device_name: host.default_output_device().unwrap().name().unwrap(),
         }
     }
 }
@@ -216,12 +220,31 @@ struct Server {
     dbs: VecDeque<f32>,
 }
 
-#[derive(Default)]
 struct MyApp {
     listen_str: String,
     servers: Vec<Server>,
     current_settings: ConnectionSettings,
+    host: Arc<Host>,
+    cached_input_device_names: Vec<String>,
+    cached_output_device_names: Vec<String>,
 }
+
+impl MyApp {
+    fn new() -> Self {
+        let host = Arc::new(cpal::default_host());
+
+        println!("Selected host: {}", host.id().name());
+        Self {
+            listen_str: String::new(),
+            servers: vec![],
+            current_settings: ConnectionSettings::new(&host),
+            host,
+            cached_input_device_names: vec![],
+            cached_output_device_names: vec![],
+        }
+    }
+}
+
 fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -230,7 +253,7 @@ fn main() {
     eframe::run_native(
         "Basic eframe UI",
         options,
-        Box::new(|_cc| Ok(Box::new(MyApp::default()))),
+        Box::new(|_cc| Ok(Box::new(MyApp::new()))),
     )
     .unwrap();
 }
@@ -270,6 +293,7 @@ impl eframe::App for MyApp {
                                     dbs: VecDeque::new(),
                                 });
                                 let listen_str = self.listen_str.clone();
+                                let host = Arc::clone(&self.host);
 
                                 std::thread::spawn(move || {
                                     start(
@@ -279,6 +303,7 @@ impl eframe::App for MyApp {
                                         aud_tx,
                                         Arc::clone(&muted),
                                         settings,
+                                        host,
                                     );
                                 });
                             }
@@ -297,7 +322,7 @@ impl eframe::App for MyApp {
                                     dbs: VecDeque::new(),
                                 });
                                 let listen_str = self.listen_str.clone();
-
+                                let host = Arc::clone(&self.host);
                                 std::thread::spawn(move || {
                                     start(
                                         listen_str.parse().unwrap(),
@@ -306,6 +331,7 @@ impl eframe::App for MyApp {
                                         aud_tx,
                                         Arc::clone(&muted),
                                         settings,
+                                        host,
                                     );
                                 });
                             }
@@ -318,6 +344,27 @@ impl eframe::App for MyApp {
                                 egui::Slider::new(&mut self.current_settings.latency, 0.01..=3.0)
                                     .text("Audio stream latency (higher = more reliable)"),
                             );
+                            if egui::ComboBox::from_label("Input device")
+                                .selected_text(self.current_settings.input_device_name.clone())
+                                .show_ui(ui, |ui| {
+                                    for dev in &self.cached_input_device_names {
+                                        ui.selectable_value(
+                                            &mut self.current_settings.input_device_name,
+                                            dev.clone(),
+                                            dev,
+                                        );
+                                    }
+                                })
+                                .response
+                                .clicked()
+                            {
+                                self.cached_input_device_names = self
+                                    .host
+                                    .input_devices()
+                                    .unwrap()
+                                    .map(|x| x.name().unwrap())
+                                    .collect();
+                            };
                             ui.group(|ui| {
                                 ui.vertical_centered_justified(|ui| {
                                     ui.label("Opus encoding");
@@ -467,7 +514,7 @@ impl eframe::App for MyApp {
                                 }
                             }
                             ui.group(|ui| {
-                                ui.set_min_width(ui.available_width() - 10.0);
+                                ui.set_min_width(ui.available_width() - 80.0);
                                 if server.is_server {
                                     ui.label("Server");
                                 } else {
@@ -476,7 +523,7 @@ impl eframe::App for MyApp {
                                 ui.label(format!("State: {:?}", server.state));
                                 ui.horizontal_centered(|ui| {
                                     if ui.button("Kill").clicked() {
-                                        server.ui_tx.send(UiUpdate::Kill).unwrap();
+                                        let _ = server.ui_tx.send(UiUpdate::Kill);
                                     }
                                     if !server.muted.load(Ordering::Relaxed) {
                                         if ui.button("Mute").clicked() {
@@ -526,40 +573,26 @@ fn start(
     tx: Sender<AudioUpdate>,
     mute_sender: Arc<AtomicBool>,
     settings: Arc<ConnectionSettings>,
-) {
-    tx.send(AudioUpdate::ServerState(ServerState::InitAudioSystem))
-        .unwrap();
-    let host = cpal::default_host();
-    println!("Selected host: {}", host.id().name());
-
-    println!(
-        "Input devices: {:?}",
-        host.input_devices()
-            .unwrap()
-            .map(|x| x.name().unwrap())
-            .collect::<Vec<_>>()
-    );
-
-    println!(
-        "Output devices: {:?}",
-        host.output_devices()
-            .unwrap()
-            .map(|x| x.name().unwrap())
-            .collect::<Vec<_>>()
-    );
-
-    let input_device = host.default_input_device().unwrap();
-    let output_device = host.default_output_device().unwrap();
-
-    let mut config: StreamConfig = input_device.default_input_config().unwrap().into();
+    host: Arc<Host>,
+) -> Result<()> {
+    tx.send(AudioUpdate::ServerState(ServerState::InitAudioSystem))?;
+    let input_device = host
+        .input_devices()?
+        .find(|x| x.name().unwrap() == settings.input_device_name)
+        .ok_or(anyhow!("can't find input device"))?;
+    let output_device = host
+        .output_devices()?
+        .find(|x| x.name().unwrap() == settings.output_device_name)
+        .ok_or(anyhow!("can't find output device"))?;
+    let mut config: StreamConfig = input_device.default_input_config()?.into();
     config.channels = 1;
     config.sample_rate = cpal::SampleRate(48000);
     println!("Config: {config:?}");
 
     println!(
         "Input device: {}, output device: {}",
-        input_device.name().unwrap(),
-        output_device.name().unwrap()
+        input_device.name()?,
+        output_device.name()?
     );
 
     let latency_frames = settings.latency * config.sample_rate.0 as f32;
@@ -595,7 +628,7 @@ fn start(
     };
 
     // 3762 wil be the audio sample buffer size
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])?;
     let der = CertificateDer::from(cert.cert);
     let der_1 = der.clone();
 
@@ -606,7 +639,11 @@ fn start(
     let stopped_1 = Arc::clone(&stopped);
     let stopped_2 = Arc::clone(&stopped);
     let tx_ = tx.clone();
-
+    let settings_1 = Arc::clone(&settings);
+    let input_stream = input_device.build_input_stream(&config, input_data_fn, err_fn, None)?;
+    let output_stream = output_device.build_output_stream(&config, output_data_fn, err_fn, None)?;
+    input_stream.play()?;
+    output_stream.play()?;
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -659,7 +696,7 @@ fn start(
                         consumer_2.clone(),
                         con,
                         Arc::clone(&stopped),
-                        Arc::clone(&settings),
+                        Arc::clone(&settings_1),
                         tx.clone(),
                     )
                     .await
@@ -707,7 +744,7 @@ fn start(
                         consumer_2,
                         connection,
                         Arc::clone(&stopped),
-                        Arc::clone(&settings),
+                        Arc::clone(&settings_1),
                         tx.clone(),
                     )
                     .await
@@ -719,15 +756,6 @@ fn start(
             }
         });
     });
-
-    let input_stream = input_device
-        .build_input_stream(&config, input_data_fn, err_fn, None)
-        .unwrap();
-    let output_stream = output_device
-        .build_output_stream(&config, output_data_fn, err_fn, None)
-        .unwrap();
-    input_stream.play().unwrap();
-    output_stream.play().unwrap();
     while !stopped_1.load(Ordering::Relaxed) {
         if let Ok(update) = rx.try_recv() {
             match update {
@@ -742,7 +770,8 @@ fn start(
     drop(output_stream);
     stopped_2.store(true, Ordering::Relaxed);
     println!("Done!");
-    tx_.send(AudioUpdate::Dead).unwrap();
+    tx_.send(AudioUpdate::Dead)?;
+    Ok(())
 }
 
 fn err_fn(err: cpal::StreamError) {
