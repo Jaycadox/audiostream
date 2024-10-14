@@ -11,8 +11,10 @@ byteorder = "1.5.0"
 cpal = "0.15.3"
 crossbeam = "0.8.4"
 eframe = "0.29.1"
+egui_plot = "0.29.0"
 quinn = "0.11.5"
 rcgen = "0.13.1"
 ringbuf = "0.4.7"
 rustls = { version = "0.23.14", features = ["ring"] }
+strum = { version = "0.26.3", features = ["derive"] }
 tokio = { version = "1.40.0", features = ["full"] }

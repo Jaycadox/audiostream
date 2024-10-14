@@ -1,6 +1,6 @@
 mod skip_verification;
 use std::{
-    mem,
+    collections::VecDeque,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -10,16 +10,16 @@ use std::{
     time::Duration,
 };
 
-use byteorder::{ByteOrder, NetworkEndian};
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     InputCallbackInfo, OutputCallbackInfo, StreamConfig,
 };
-use eframe::egui;
+use eframe::egui::{self, Vec2b};
+use egui_plot::{AxisHints, Line, Plot, PlotBounds, PlotPoints};
 use quinn::{
     crypto::rustls::QuicClientConfig,
     rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig,
+    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, VarInt,
 };
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -39,22 +39,37 @@ async fn start_audio_channel<
     producer: Arc<Mutex<A>>,
     consumer: Arc<Mutex<B>>,
     connection: Connection,
+    stopped: Arc<AtomicBool>,
+    settings: Arc<ConnectionSettings>,
+    audio_update: Sender<AudioUpdate>,
 ) -> Result<()> {
     let connection = Arc::new(Mutex::new(connection));
     let connection_1 = Arc::clone(&connection);
+    let connection_2 = Arc::clone(&connection);
+    let stopped_1 = Arc::clone(&stopped);
+    let &AudioEncoding::Opus {
+        purpose,
+        bandwidth,
+        bit_rate,
+        signal_type,
+    } = &settings.encoding;
     let write = tokio::spawn(async move {
-        let encoder = audiopus::coder::Encoder::new(
+        let mut encoder = audiopus::coder::Encoder::new(
             audiopus::SampleRate::Hz48000,
             audiopus::Channels::Mono,
-            audiopus::Application::Voip,
+            purpose,
         )
         .unwrap();
+        encoder.set_bandwidth(bandwidth).unwrap();
+        encoder.set_bitrate(bit_rate).unwrap();
+        encoder.set_signal(signal_type).unwrap();
         while match connection.lock() {
             Ok(x) => x,
             _ => return Err(anyhow!("connection lost")),
         }
         .close_reason()
         .is_none()
+            && !stopped.load(Ordering::Relaxed)
         {
             //println!("sent");
             let mut samples = vec![0.0; 2880];
@@ -67,7 +82,7 @@ async fn start_audio_channel<
                 }
                 .pop_slice(&mut samples[cursor..]);
                 cursor += len;
-                tokio::task::yield_now().await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
             }
             let len = 2880;
             if len == 0 {
@@ -84,6 +99,7 @@ async fn start_audio_channel<
             let Ok(_) = tx.write_all(&samples).await else {
                 break;
             };
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
         println!("stopping audio write");
         Ok(())
@@ -98,6 +114,7 @@ async fn start_audio_channel<
         }
         .close_reason()
         .is_none()
+            && !stopped_1.load(Ordering::Relaxed)
         {
             let Ok(len) = rx.read_u64_le().await else {
                 break;
@@ -106,26 +123,36 @@ async fn start_audio_channel<
             let Ok(_) = rx.read_exact(&mut buf).await else {
                 break;
             };
-            println!("len = {len}");
             let mut samples = vec![0.0; 2880 * 5];
             let len = decoder
                 .decode_float(Some(&buf), &mut samples, false)
                 .expect("decode error");
+
+            // Calculate root mean of squares
+            let sum =
+                samples[..len].iter().map(|x| f32::powi(*x, 2)).sum::<f32>() * (1.0 / len as f32);
+            let rms = f32::sqrt(sum);
+            // Convert to decibel scale
+            let db = 20.0 * f32::log10(rms);
+            let _ = audio_update.send(AudioUpdate::DecibelReading(db));
+
             match producer.lock() {
                 Ok(x) => x,
                 _ => break,
             }
             .push_slice(&samples[..len]);
-            tokio::task::yield_now().await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
         println!("stopping audio read");
         Ok(())
     });
     tokio::select! {
         res = write => {
+            connection_2.lock().unwrap().close(VarInt::from_u32(0), b"closed");
             return res?;
         }
         res = read => {
+            connection_2.lock().unwrap().close(VarInt::from_u32(0), b"closed");
             return res?;
         }
     }
@@ -138,6 +165,7 @@ enum UiUpdate {
 enum AudioUpdate {
     Dead,
     ServerState(ServerState),
+    DecibelReading(f32),
 }
 
 #[derive(Debug)]
@@ -149,19 +177,50 @@ enum ServerState {
     Active,
 }
 
+#[derive(Debug, Clone)]
+enum AudioEncoding {
+    Opus {
+        purpose: audiopus::Application,
+        bandwidth: audiopus::Bandwidth,
+        bit_rate: audiopus::Bitrate,
+        signal_type: audiopus::Signal,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionSettings {
+    encoding: AudioEncoding,
+    latency: f32,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            encoding: AudioEncoding::Opus {
+                purpose: audiopus::Application::Voip,
+                bandwidth: audiopus::Bandwidth::Auto,
+                bit_rate: audiopus::Bitrate::Auto,
+                signal_type: audiopus::Signal::Voice,
+            },
+            latency: 0.1,
+        }
+    }
+}
+
 struct Server {
     ui_tx: Sender<UiUpdate>,
     aud_rx: Receiver<AudioUpdate>,
     is_server: bool,
     state: ServerState,
+    muted: Arc<AtomicBool>,
+    dbs: VecDeque<f32>,
 }
 
 #[derive(Default)]
 struct MyApp {
-    loopback_sender: Option<(Sender<UiUpdate>, Sender<UiUpdate>)>,
-    latency: f32,
     listen_str: String,
     servers: Vec<Server>,
+    current_settings: ConnectionSettings,
 }
 fn main() {
     rustls::crypto::ring::default_provider()
@@ -172,7 +231,8 @@ fn main() {
         "Basic eframe UI",
         options,
         Box::new(|_cc| Ok(Box::new(MyApp::default()))),
-    );
+    )
+    .unwrap();
 }
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -197,14 +257,17 @@ impl eframe::App for MyApp {
                         ui.horizontal(|ui| {
                             ui.text_edit_singleline(&mut self.listen_str);
                             if ui.button("Connect").clicked() {
-                                let latency = self.latency.clone();
+                                let settings = Arc::new(self.current_settings.clone());
                                 let (ui_tx, ui_rx) = std::sync::mpsc::channel();
                                 let (aud_tx, aud_rx) = std::sync::mpsc::channel();
+                                let muted = Arc::new(AtomicBool::new(false));
                                 self.servers.push(Server {
                                     ui_tx: ui_tx.clone(),
                                     aud_rx,
                                     is_server: false,
                                     state: ServerState::Init,
+                                    muted: Arc::clone(&muted),
+                                    dbs: VecDeque::new(),
                                 });
                                 let listen_str = self.listen_str.clone();
 
@@ -214,21 +277,24 @@ impl eframe::App for MyApp {
                                         false,
                                         ui_rx,
                                         aud_tx,
-                                        false,
-                                        latency,
+                                        Arc::clone(&muted),
+                                        settings,
                                     );
                                 });
                             }
                             ui.label("or");
                             if ui.button("Start server").clicked() {
-                                let latency = self.latency.clone();
+                                let settings = Arc::new(self.current_settings.clone());
                                 let (ui_tx, ui_rx) = std::sync::mpsc::channel();
                                 let (aud_tx, aud_rx) = std::sync::mpsc::channel();
+                                let muted = Arc::new(AtomicBool::new(false));
                                 self.servers.push(Server {
                                     ui_tx: ui_tx.clone(),
                                     aud_rx,
                                     is_server: true,
                                     state: ServerState::Init,
+                                    muted: Arc::clone(&muted),
+                                    dbs: VecDeque::new(),
                                 });
                                 let listen_str = self.listen_str.clone();
 
@@ -238,62 +304,133 @@ impl eframe::App for MyApp {
                                         true,
                                         ui_rx,
                                         aud_tx,
-                                        false,
-                                        latency,
+                                        Arc::clone(&muted),
+                                        settings,
                                     );
                                 });
                             }
                         });
                         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-                            ui.heading("Settings");
+                            ui.vertical_centered(|ui| {
+                                ui.heading("Settings");
+                            });
                             ui.add(
-                                egui::Slider::new(&mut self.latency, 0.01..=3.0)
+                                egui::Slider::new(&mut self.current_settings.latency, 0.01..=3.0)
                                     .text("Audio stream latency (higher = more reliable)"),
                             );
-                            match &self.loopback_sender {
-                                Some(sender) => {
-                                    if ui.button("Kill loopback server").clicked() {
-                                        sender.0.send(UiUpdate::Kill).unwrap();
-                                        sender.1.send(UiUpdate::Kill).unwrap();
-                                        self.loopback_sender = None;
-                                    }
-                                }
-                                None => {
-                                    if ui.button("Start loopback server (hear yourself)").clicked()
+                            ui.group(|ui| {
+                                ui.vertical_centered_justified(|ui| {
+                                    ui.label("Opus encoding");
+                                    if let AudioEncoding::Opus {
+                                        purpose,
+                                        bandwidth,
+                                        bit_rate,
+                                        signal_type,
+                                    } = &mut self.current_settings.encoding
                                     {
-                                        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
-                                        let (audio_tx, _audio_rx) = std::sync::mpsc::channel();
-
-                                        let (ui_tx_1, ui_rx_1) = std::sync::mpsc::channel();
-                                        let (audio_tx_1, _audio_rx_1) = std::sync::mpsc::channel();
-                                        self.loopback_sender =
-                                            Some((ui_tx.clone(), ui_tx_1.clone()));
-                                        let local_addr = SocketAddr::V4(SocketAddrV4::new(
-                                            Ipv4Addr::new(127, 0, 0, 1),
-                                            5000,
-                                        ));
-                                        let local_addr_1 = local_addr.clone();
-                                        let latency = self.latency;
-
-                                        std::thread::spawn(move || {
-                                            start(
-                                                local_addr, true, ui_rx, audio_tx, false, latency,
-                                            );
+                                        egui::ComboBox::from_label("Application")
+                                            .selected_text(format!("{purpose:?}"))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    purpose,
+                                                    audiopus::Application::Audio,
+                                                    "Audio",
+                                                );
+                                                ui.selectable_value(
+                                                    purpose,
+                                                    audiopus::Application::LowDelay,
+                                                    "LowDelay",
+                                                );
+                                                ui.selectable_value(
+                                                    purpose,
+                                                    audiopus::Application::Voip,
+                                                    "Voip",
+                                                );
+                                            });
+                                        egui::ComboBox::from_label("Bandwidth")
+                                            .selected_text(format!("{bandwidth:?}"))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Auto,
+                                                    "Auto",
+                                                );
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Fullband,
+                                                    "Fullband",
+                                                );
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Mediumband,
+                                                    "Mediumband",
+                                                );
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Narrowband,
+                                                    "Narrowband",
+                                                );
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Superwideband,
+                                                    "Superwideband",
+                                                );
+                                                ui.selectable_value(
+                                                    bandwidth,
+                                                    audiopus::Bandwidth::Wideband,
+                                                    "Wideband",
+                                                );
+                                            });
+                                        ui.horizontal(|ui| {
+                                            egui::ComboBox::from_label("Bitrate")
+                                                .selected_text(format!("{bit_rate:?}"))
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(
+                                                        bit_rate,
+                                                        audiopus::Bitrate::Auto,
+                                                        "Auto",
+                                                    );
+                                                    ui.selectable_value(
+                                                        bit_rate,
+                                                        audiopus::Bitrate::Max,
+                                                        "Max",
+                                                    );
+                                                    ui.selectable_value(
+                                                        bit_rate,
+                                                        audiopus::Bitrate::BitsPerSecond(98_000),
+                                                        "Custom",
+                                                    );
+                                                });
+                                            if let audiopus::Bitrate::BitsPerSecond(num) = bit_rate
+                                            {
+                                                ui.add(
+                                                    egui::Slider::new(num, 1000..=256_000)
+                                                        .text("Custom bitrate (bits/sec)"),
+                                                );
+                                            }
                                         });
-
-                                        std::thread::spawn(move || {
-                                            start(
-                                                local_addr_1,
-                                                false,
-                                                ui_rx_1,
-                                                audio_tx_1,
-                                                true,
-                                                latency,
-                                            );
-                                        });
+                                        egui::ComboBox::from_label("Signal type")
+                                            .selected_text(format!("{signal_type:?}"))
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    signal_type,
+                                                    audiopus::Signal::Auto,
+                                                    "Auto",
+                                                );
+                                                ui.selectable_value(
+                                                    signal_type,
+                                                    audiopus::Signal::Music,
+                                                    "Music",
+                                                );
+                                                ui.selectable_value(
+                                                    signal_type,
+                                                    audiopus::Signal::Voice,
+                                                    "Voice",
+                                                );
+                                            });
                                     }
-                                }
-                            }
+                                });
+                            });
                         });
                     },
                 );
@@ -303,7 +440,9 @@ impl eframe::App for MyApp {
                     egui::vec2(available_width * right_percentage, 100.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.heading("Server rack");
+                        ui.vertical_centered(|ui| {
+                            ui.heading("Server rack");
+                        });
                         if self.servers.is_empty() {
                             ui.label(
                                 "Start a server or connect to a server for something to show here",
@@ -311,7 +450,7 @@ impl eframe::App for MyApp {
                         }
                         let mut dead_servers = vec![];
                         for (i, server) in self.servers.iter_mut().enumerate() {
-                            if let Ok(msg) = server.aud_rx.try_recv() {
+                            while let Ok(msg) = server.aud_rx.try_recv() {
                                 match msg {
                                     AudioUpdate::Dead => {
                                         dead_servers.push(i);
@@ -319,18 +458,53 @@ impl eframe::App for MyApp {
                                     AudioUpdate::ServerState(server_state) => {
                                         server.state = server_state;
                                     }
+                                    AudioUpdate::DecibelReading(db) => {
+                                        if server.dbs.len() > 80 {
+                                            let _ = server.dbs.pop_front();
+                                        }
+                                        server.dbs.push_back(db);
+                                    }
                                 }
                             }
                             ui.group(|ui| {
+                                ui.set_min_width(ui.available_width() - 10.0);
                                 if server.is_server {
                                     ui.label("Server");
                                 } else {
                                     ui.label("Client");
                                 }
                                 ui.label(format!("State: {:?}", server.state));
-                                if ui.button("Kill").clicked() {
-                                    server.ui_tx.send(UiUpdate::Kill).unwrap();
-                                }
+                                ui.horizontal_centered(|ui| {
+                                    if ui.button("Kill").clicked() {
+                                        server.ui_tx.send(UiUpdate::Kill).unwrap();
+                                    }
+                                    if !server.muted.load(Ordering::Relaxed) {
+                                        if ui.button("Mute").clicked() {
+                                            server.muted.store(true, Ordering::Relaxed);
+                                        }
+                                    } else {
+                                        if ui.button("Unmute").clicked() {
+                                            server.muted.store(false, Ordering::Relaxed);
+                                        }
+                                    }
+                                });
+                                let sin: PlotPoints = server
+                                    .dbs
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, x)| {
+                                        let x = *x as f64;
+                                        [i as f64, x]
+                                    })
+                                    .collect();
+                                let line = Line::new(sin);
+                                Plot::new(format!("db{i}")).show(ui, |plot_ui| {
+                                    plot_ui.set_plot_bounds(PlotBounds::from_min_max(
+                                        [0.0, -60.0],
+                                        [80.0, 0.0],
+                                    ));
+                                    plot_ui.line(line);
+                                });
                             });
                         }
                         dead_servers.reverse();
@@ -341,6 +515,7 @@ impl eframe::App for MyApp {
                 );
             });
         });
+        ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
 
@@ -349,8 +524,8 @@ fn start(
     server: bool,
     rx: Receiver<UiUpdate>,
     tx: Sender<AudioUpdate>,
-    mute_sender: bool,
-    latency: f32,
+    mute_sender: Arc<AtomicBool>,
+    settings: Arc<ConnectionSettings>,
 ) {
     tx.send(AudioUpdate::ServerState(ServerState::InitAudioSystem))
         .unwrap();
@@ -387,7 +562,7 @@ fn start(
         output_device.name().unwrap()
     );
 
-    let latency_frames = latency * config.sample_rate.0 as f32;
+    let latency_frames = settings.latency * config.sample_rate.0 as f32;
     let latency_samples = latency_frames as usize * config.channels as usize;
     println!("Frames: {latency_frames}, samples: {latency_samples}");
     let send_ring = HeapRb::<f32>::new(latency_samples * 2);
@@ -404,28 +579,19 @@ fn start(
     for _ in 0..latency_samples {
         recv_producer.lock().unwrap().try_push(0.0).unwrap();
     }
-    let mut input_error_count = 0;
     let producer_1 = Arc::clone(&send_producer);
     let input_data_fn = move |data: &[f32], _: &InputCallbackInfo| {
-        if mute_sender {
+        if mute_sender.load(Ordering::Relaxed) {
+            let zeros = vec![0.0; data.len()];
+            producer_1.lock().unwrap().push_slice(&zeros);
             return;
         }
-        let count = producer_1.lock().unwrap().push_slice(data);
-        if count < data.len() {
-            input_error_count += 1;
-            //println!("input falling behind {input_error_count}");
-        } else {
-            input_error_count = 0;
-        }
+        producer_1.lock().unwrap().push_slice(data);
     };
 
     let consumer_1 = Arc::clone(&recv_consumer);
     let output_data_fn = move |data: &mut [f32], _: &OutputCallbackInfo| {
-        //println!("len: {}", data.len());
-        let count = consumer_1.lock().unwrap().pop_slice(data);
-        if count < data.len() {
-            //println!("output falling behind");
-        }
+        consumer_1.lock().unwrap().pop_slice(data);
     };
 
     // 3762 wil be the audio sample buffer size
@@ -438,6 +604,7 @@ fn start(
 
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_1 = Arc::clone(&stopped);
+    let stopped_2 = Arc::clone(&stopped);
     let tx_ = tx.clone();
 
     std::thread::spawn(move || {
@@ -457,46 +624,52 @@ fn start(
                         .max_idle_timeout(Some(Duration::from_secs(1).try_into().unwrap()));
                     let endpoint = Endpoint::server(server_config, addr).unwrap();
 
-                    while !stopped.load(Ordering::Relaxed) {
-                        tx.send(AudioUpdate::ServerState(ServerState::WaitingForPeer))
-                            .unwrap();
-                        let incoming = match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(1),
-                            endpoint.accept(),
-                        )
-                        .await
-                        {
-                            Ok(x) => x,
-                            _ => continue,
-                        }
+                    tx.send(AudioUpdate::ServerState(ServerState::WaitingForPeer))
                         .unwrap();
-                        tx.send(AudioUpdate::ServerState(ServerState::CreatingChannel))
-                            .unwrap();
-
-                        let con = match tokio::time::timeout(
-                            tokio::time::Duration::from_secs(1),
-                            incoming,
-                        )
-                        .await
-                        {
-                            Ok(x) => x,
-                            _ => continue,
-                        }
-                        .unwrap();
-                        println!("accepted: {:?}", con.remote_address());
-                        let (tx1, rx) = con.open_bi().await.unwrap();
-
-                        tx.send(AudioUpdate::ServerState(ServerState::Active))
-                            .unwrap();
-                        start_audio_channel(tx1, rx, producer_2.clone(), consumer_2.clone(), con)
-                            .await
-                            .unwrap();
+                    let incoming = match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(100), //HACK
+                        endpoint.accept(),
+                    )
+                    .await
+                    {
+                        Ok(x) => x,
+                        _ => return,
                     }
+                    .unwrap();
+                    tx.send(AudioUpdate::ServerState(ServerState::CreatingChannel))
+                        .unwrap();
+
+                    let con =
+                        match tokio::time::timeout(tokio::time::Duration::from_secs(1), incoming)
+                            .await
+                        {
+                            Ok(x) => x,
+                            _ => return,
+                        }
+                        .unwrap();
+                    println!("accepted: {:?}", con.remote_address());
+                    let (tx1, rx) = con.open_bi().await.unwrap();
+
+                    tx.send(AudioUpdate::ServerState(ServerState::Active))
+                        .unwrap();
+                    start_audio_channel(
+                        tx1,
+                        rx,
+                        producer_2.clone(),
+                        consumer_2.clone(),
+                        con,
+                        Arc::clone(&stopped),
+                        Arc::clone(&settings),
+                        tx.clone(),
+                    )
+                    .await
+                    .unwrap();
                     println!("ended");
                     drop(endpoint);
                     stopped.store(true, Ordering::Relaxed);
                 })
-                .await;
+                .await
+                .unwrap();
             } else {
                 tokio::spawn(async move {
                     let mut certs = rustls::RootCertStore::empty();
@@ -527,12 +700,22 @@ fn start(
                     let (tx1, rx) = connection.accept_bi().await.unwrap();
                     tx.send(AudioUpdate::ServerState(ServerState::Active))
                         .unwrap();
-                    start_audio_channel(tx1, rx, producer_2, consumer_2, connection)
-                        .await
-                        .unwrap();
+                    start_audio_channel(
+                        tx1,
+                        rx,
+                        producer_2,
+                        consumer_2,
+                        connection,
+                        Arc::clone(&stopped),
+                        Arc::clone(&settings),
+                        tx.clone(),
+                    )
+                    .await
+                    .unwrap();
                     stopped.store(true, Ordering::Relaxed);
                 })
-                .await;
+                .await
+                .unwrap();
             }
         });
     });
@@ -557,28 +740,11 @@ fn start(
     }
     drop(input_stream);
     drop(output_stream);
+    stopped_2.store(true, Ordering::Relaxed);
     println!("Done!");
     tx_.send(AudioUpdate::Dead).unwrap();
 }
 
 fn err_fn(err: cpal::StreamError) {
     eprintln!("an error occurred on stream: {}", err);
-}
-
-fn f32_to_u8_slice(floats: &[f32]) -> Vec<u8> {
-    let mut bytes = vec![0u8; floats.len() * mem::size_of::<f32>()];
-    for (i, &float) in floats.iter().enumerate() {
-        NetworkEndian::write_f32(&mut bytes[i * mem::size_of::<f32>()..], float);
-    }
-    bytes
-}
-
-fn u8_to_f32_slice(bytes: &[u8]) -> Vec<f32> {
-    assert!(bytes.len() % mem::size_of::<f32>() == 0);
-    let mut floats = Vec::with_capacity(bytes.len() / mem::size_of::<f32>());
-    for chunk in bytes.chunks_exact(mem::size_of::<f32>()) {
-        let float = NetworkEndian::read_f32(chunk);
-        floats.push(float);
-    }
-    floats
 }
