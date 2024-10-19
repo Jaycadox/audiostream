@@ -164,6 +164,29 @@ impl eframe::App for MyApp {
                                             .map(|x| x.name().unwrap())
                                             .collect();
                                     };
+                                    if egui::ComboBox::from_label("Output device")
+                                        .selected_text(
+                                            self.current_settings.output_device_name.clone(),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for dev in &self.cached_output_device_names {
+                                                ui.selectable_value(
+                                                    &mut self.current_settings.output_device_name,
+                                                    dev.clone(),
+                                                    dev,
+                                                );
+                                            }
+                                        })
+                                        .response
+                                        .clicked()
+                                    {
+                                        self.cached_output_device_names = self
+                                            .host
+                                            .output_devices()
+                                            .unwrap()
+                                            .map(|x| x.name().unwrap())
+                                            .collect();
+                                    };
 
                                     let mut mixer = self.mixer.lock().unwrap();
                                     ui.group(|ui| {
