@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -11,11 +11,11 @@ use cpal::{
     traits::{DeviceTrait, HostTrait},
     Host,
 };
-use eframe::egui;
+use eframe::egui::{self, menu::SubMenu, CollapsingHeader};
 use egui_plot::{Line, Plot, PlotBounds, PlotPoints};
 
 use crate::{
-    audio::{AudioEncoding, ConnectionSettings},
+    audio::{AudioEncoding, ConnectionSettings, Mixer, NoiseGate},
     server::{start, AudioUpdate, Server, ServerState, UiUpdate},
 };
 
@@ -26,20 +26,23 @@ pub struct MyApp {
     host: Arc<Host>,
     cached_input_device_names: Vec<String>,
     cached_output_device_names: Vec<String>,
+    mixer: Arc<Mutex<Mixer>>,
 }
 
 impl MyApp {
     pub fn new() -> Self {
         let host = Arc::new(cpal::default_host());
 
+        let mixer = Arc::new(Mutex::new(Mixer { effects: vec![] }));
         println!("Selected host: {}", host.id().name());
         Self {
             listen_str: String::new(),
             servers: vec![],
-            current_settings: ConnectionSettings::new(&host),
+            current_settings: ConnectionSettings::new(&host, &mixer),
             host,
             cached_input_device_names: vec![],
             cached_output_device_names: vec![],
+            mixer,
         }
     }
 }
@@ -90,7 +93,8 @@ impl eframe::App for MyApp {
                                         Arc::clone(&muted),
                                         settings,
                                         host,
-                                    );
+                                    )
+                                    .unwrap();
                                 });
                             }
                             ui.label("or");
@@ -118,153 +122,211 @@ impl eframe::App for MyApp {
                                         Arc::clone(&muted),
                                         settings,
                                         host,
-                                    );
+                                    )
+                                    .unwrap();
                                 });
                             }
                         });
-                        egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
-                            ui.vertical_centered(|ui| {
-                                ui.heading("Settings");
-                            });
-                            ui.add(
-                                egui::Slider::new(&mut self.current_settings.latency, 0.01..=3.0)
-                                    .text("Audio stream latency (higher = more reliable)"),
-                            );
-                            if egui::ComboBox::from_label("Input device")
-                                .selected_text(self.current_settings.input_device_name.clone())
-                                .show_ui(ui, |ui| {
-                                    for dev in &self.cached_input_device_names {
-                                        ui.selectable_value(
-                                            &mut self.current_settings.input_device_name,
-                                            dev.clone(),
-                                            dev,
-                                        );
-                                    }
-                                })
-                                .response
-                                .clicked()
-                            {
-                                self.cached_input_device_names = self
-                                    .host
-                                    .input_devices()
-                                    .unwrap()
-                                    .map(|x| x.name().unwrap())
-                                    .collect();
-                            };
-                            ui.group(|ui| {
-                                ui.vertical_centered_justified(|ui| {
-                                    ui.label("Opus encoding");
-                                    if let AudioEncoding::Opus {
-                                        purpose,
-                                        bandwidth,
-                                        bit_rate,
-                                        signal_type,
-                                    } = &mut self.current_settings.encoding
-                                    {
-                                        egui::ComboBox::from_label("Application")
-                                            .selected_text(format!("{purpose:?}"))
-                                            .show_ui(ui, |ui| {
+                        egui::TopBottomPanel::bottom("bottom_panel")
+                            .min_height(300.0)
+                            .show(ctx, |ui| {
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.vertical_centered(|ui| {
+                                        ui.heading("Settings");
+                                    });
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.current_settings.latency,
+                                            0.01..=3.0,
+                                        )
+                                        .text("Audio stream latency (higher = more reliable)"),
+                                    );
+                                    if egui::ComboBox::from_label("Input device")
+                                        .selected_text(
+                                            self.current_settings.input_device_name.clone(),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for dev in &self.cached_input_device_names {
                                                 ui.selectable_value(
-                                                    purpose,
-                                                    audiopus::Application::Audio,
-                                                    "Audio",
-                                                );
-                                                ui.selectable_value(
-                                                    purpose,
-                                                    audiopus::Application::LowDelay,
-                                                    "LowDelay",
-                                                );
-                                                ui.selectable_value(
-                                                    purpose,
-                                                    audiopus::Application::Voip,
-                                                    "Voip",
-                                                );
-                                            });
-                                        egui::ComboBox::from_label("Bandwidth")
-                                            .selected_text(format!("{bandwidth:?}"))
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Auto,
-                                                    "Auto",
-                                                );
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Fullband,
-                                                    "Fullband",
-                                                );
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Mediumband,
-                                                    "Mediumband",
-                                                );
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Narrowband,
-                                                    "Narrowband",
-                                                );
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Superwideband,
-                                                    "Superwideband",
-                                                );
-                                                ui.selectable_value(
-                                                    bandwidth,
-                                                    audiopus::Bandwidth::Wideband,
-                                                    "Wideband",
-                                                );
-                                            });
-                                        ui.horizontal(|ui| {
-                                            egui::ComboBox::from_label("Bitrate")
-                                                .selected_text(format!("{bit_rate:?}"))
-                                                .show_ui(ui, |ui| {
-                                                    ui.selectable_value(
-                                                        bit_rate,
-                                                        audiopus::Bitrate::Auto,
-                                                        "Auto",
-                                                    );
-                                                    ui.selectable_value(
-                                                        bit_rate,
-                                                        audiopus::Bitrate::Max,
-                                                        "Max",
-                                                    );
-                                                    ui.selectable_value(
-                                                        bit_rate,
-                                                        audiopus::Bitrate::BitsPerSecond(98_000),
-                                                        "Custom",
-                                                    );
-                                                });
-                                            if let audiopus::Bitrate::BitsPerSecond(num) = bit_rate
-                                            {
-                                                ui.add(
-                                                    egui::Slider::new(num, 1000..=256_000)
-                                                        .text("Custom bitrate (bits/sec)"),
+                                                    &mut self.current_settings.input_device_name,
+                                                    dev.clone(),
+                                                    dev,
                                                 );
                                             }
-                                        });
-                                        egui::ComboBox::from_label("Signal type")
-                                            .selected_text(format!("{signal_type:?}"))
-                                            .show_ui(ui, |ui| {
-                                                ui.selectable_value(
-                                                    signal_type,
-                                                    audiopus::Signal::Auto,
-                                                    "Auto",
-                                                );
-                                                ui.selectable_value(
-                                                    signal_type,
-                                                    audiopus::Signal::Music,
-                                                    "Music",
-                                                );
-                                                ui.selectable_value(
-                                                    signal_type,
-                                                    audiopus::Signal::Voice,
-                                                    "Voice",
-                                                );
+                                        })
+                                        .response
+                                        .clicked()
+                                    {
+                                        self.cached_input_device_names = self
+                                            .host
+                                            .input_devices()
+                                            .unwrap()
+                                            .map(|x| x.name().unwrap())
+                                            .collect();
+                                    };
+
+                                    let mut mixer = self.mixer.lock().unwrap();
+                                    ui.group(|ui| {
+                                        ui.set_min_width(ui.available_width());
+                                        ui.label("Effect rack");
+                                        if ui.button("Noise gate").clicked() {
+                                            let len = mixer.effects.len();
+                                            mixer.effects.push(Box::new(NoiseGate {
+                                                idx: len as u32,
+                                                threshold: -40.0,
+                                                attack: 2,
+                                                decay: 10,
+                                                strength: 0.8,
+                                                current: 1.0,
+                                            }));
+                                        }
+                                    });
+                                    ui.separator();
+                                    let mut removed = None;
+                                    let resp = egui_dnd::dnd(ui, "Effects").show(
+                                        mixer.effects.iter_mut().enumerate(),
+                                        |ui, (i, effect), handle, state| {
+                                            ui.horizontal(|ui| {
+                                                handle.ui(ui, |ui| {
+                                                    ui.label("*");
+                                                });
+                                                CollapsingHeader::new(effect.name())
+                                                    .default_open(true)
+                                                    .show(ui, |ui| {
+                                                        if ui.button("Remove").clicked() {
+                                                            removed = Some(i);
+                                                        }
+                                                        ui.separator();
+                                                        effect.show(ui);
+                                                    });
                                             });
+                                            ui.separator();
+                                        },
+                                    );
+                                    if let Some(i) = removed {
+                                        mixer.effects.remove(i);
                                     }
+                                    if resp.is_drag_finished() {
+                                        resp.update_vec(&mut mixer.effects);
+                                    }
+                                    ui.group(|ui| {
+                                        ui.vertical_centered_justified(|ui| {
+                                            ui.label("Opus encoding");
+                                            if let AudioEncoding::Opus {
+                                                purpose,
+                                                bandwidth,
+                                                bit_rate,
+                                                signal_type,
+                                            } = &mut self.current_settings.encoding
+                                            {
+                                                egui::ComboBox::from_label("Application")
+                                                    .selected_text(format!("{purpose:?}"))
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(
+                                                            purpose,
+                                                            audiopus::Application::Audio,
+                                                            "Audio",
+                                                        );
+                                                        ui.selectable_value(
+                                                            purpose,
+                                                            audiopus::Application::LowDelay,
+                                                            "LowDelay",
+                                                        );
+                                                        ui.selectable_value(
+                                                            purpose,
+                                                            audiopus::Application::Voip,
+                                                            "Voip",
+                                                        );
+                                                    });
+                                                egui::ComboBox::from_label("Bandwidth")
+                                                    .selected_text(format!("{bandwidth:?}"))
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Auto,
+                                                            "Auto",
+                                                        );
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Fullband,
+                                                            "Fullband",
+                                                        );
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Mediumband,
+                                                            "Mediumband",
+                                                        );
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Narrowband,
+                                                            "Narrowband",
+                                                        );
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Superwideband,
+                                                            "Superwideband",
+                                                        );
+                                                        ui.selectable_value(
+                                                            bandwidth,
+                                                            audiopus::Bandwidth::Wideband,
+                                                            "Wideband",
+                                                        );
+                                                    });
+                                                ui.horizontal(|ui| {
+                                                    egui::ComboBox::from_label("Bitrate")
+                                                        .selected_text(format!("{bit_rate:?}"))
+                                                        .show_ui(ui, |ui| {
+                                                            ui.selectable_value(
+                                                                bit_rate,
+                                                                audiopus::Bitrate::Auto,
+                                                                "Auto",
+                                                            );
+                                                            ui.selectable_value(
+                                                                bit_rate,
+                                                                audiopus::Bitrate::Max,
+                                                                "Max",
+                                                            );
+                                                            ui.selectable_value(
+                                                                bit_rate,
+                                                                audiopus::Bitrate::BitsPerSecond(
+                                                                    98_000,
+                                                                ),
+                                                                "Custom",
+                                                            );
+                                                        });
+                                                    if let audiopus::Bitrate::BitsPerSecond(num) =
+                                                        bit_rate
+                                                    {
+                                                        ui.add(
+                                                            egui::Slider::new(num, 1000..=256_000)
+                                                                .text("Custom bitrate (bits/sec)"),
+                                                        );
+                                                    }
+                                                });
+                                                egui::ComboBox::from_label("Signal type")
+                                                    .selected_text(format!("{signal_type:?}"))
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(
+                                                            signal_type,
+                                                            audiopus::Signal::Auto,
+                                                            "Auto",
+                                                        );
+                                                        ui.selectable_value(
+                                                            signal_type,
+                                                            audiopus::Signal::Music,
+                                                            "Music",
+                                                        );
+                                                        ui.selectable_value(
+                                                            signal_type,
+                                                            audiopus::Signal::Voice,
+                                                            "Voice",
+                                                        );
+                                                    });
+                                            }
+                                        });
+                                    });
                                 });
                             });
-                        });
                     },
                 );
 
